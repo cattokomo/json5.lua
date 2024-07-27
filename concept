@@ -1,0 +1,5 @@
+[ -> array
+    if ] -> return
+    t[n] = v
+    if v = ] -> return
+    elif v = , && trailing = true -> raise

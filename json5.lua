@@ -1,5 +1,6 @@
 local json5 = {}
 
+---@diagnostic disable-next-line: deprecated
 local unpack = unpack or table.unpack
 
 ---@param name string
@@ -16,7 +17,8 @@ end
 local function matchs(str, ...)
     local ret = {}
     for i = 1, select("#", ...) do
-        ret = { str:match(select(i, ...)) }
+        local v = select(i, ...)
+        ret = { str:match(v) }
         if #ret ~= 0 then
             break
         end
@@ -24,15 +26,22 @@ local function matchs(str, ...)
     return unpack(ret)
 end
 
-local function finds(str, ...)
-    local ret = {}
-    for i = 1, select("#", ...) do
-        ret = { str:find(select(i, ...)) }
-        if #ret ~= 0 then
-            break
-        end
+local function copy(tbl)
+    local t = {}
+    for i, v in pairs(tbl) do
+        t[i] = type(v) == "table" and copy(t) or v
     end
-    return unpack(ret)
+    return t
+end
+
+local function car(t)
+    return table.remove(copy(t), 1)
+end
+
+local function cdr(t)
+    t = copy(t)
+    table.remove(t, 1)
+    return t
 end
 
 -- Taken from https://github.com/rxi/json.lua/blob/master/json.lua#L189-L203
@@ -208,12 +217,8 @@ function json5.encode(value, options)
     return table.concat(rope)
 end
 
-local number_patts = {
-    "^%-?Infinity",
-    "^NaN",
-    "^[eE]",
-    "^%-?%d",
-}
+-- forward decl
+local check_chars, getchar
 
 local escape_str = {
     b = "\b",
@@ -226,6 +231,42 @@ local escape_str = {
     ['"'] = '"',
     ["'"] = "'",
     ["\\"] = "\\",
+    x = function(str, quote)
+        local err = check_chars(str, 2, quote, "incomplete hex escape")
+        if err then
+            return nil, err
+        end
+
+        local hexdigits
+        hexdigits, str = getchar(str, 2)
+
+        local num = tonumber("0x" .. hexdigits)
+        if not num then
+            return nil, "not a hex '" .. hexdigits .. "'"
+        end
+
+        return string.char(num), str
+    end,
+    u = function(str, quote)
+        local err = check_chars(str, 4, quote, "incomplete utf8 escape")
+        if err then
+            return nil, err
+        end
+
+        local codepoints
+        codepoints, str = getchar(str, 4)
+        local num = tonumber("0x" .. codepoints)
+        if not num then
+            return nil, "not a hex '" .. codepoints .. "'"
+        end
+
+        local ok, char = pcall(codepoint_to_utf8, num)
+        if ok and char then
+            return char, str
+        else
+            return nil, char
+        end
+    end
 }
 
 local line_sep = "\226\128\168"
@@ -235,7 +276,7 @@ local parag_sep = "\226\128\169"
 ---@param n number?
 ---@return string
 ---@return string
-local function getchar(str, n)
+function getchar(str, n)
     n = n or 1
     return str:sub(1, n), str:sub(1 + n)
 end
@@ -244,7 +285,7 @@ end
 ---@param len integer
 ---@param quote string
 ---@param err string
-local function check_esc(str, len, quote, err)
+function check_chars(str, len, quote, err)
     for i = 1, len do
         local c = str:sub(i, i)
         if c == quote or c == "" then
@@ -253,78 +294,57 @@ local function check_esc(str, len, quote, err)
     end
 end
 
----@param tokens any[]
----@param str string
----@return string?
----@return string?
+---@alias lex_func fun(tokens: any[], str: string): string?, string?
+
+---@type lex_func
 local function lex_string(tokens, str)
-    local quote
-    quote, str = getchar(str)
-    if quote:match("[^'\"]") then
+    local quote = str:match("^['\"]")
+    if not quote then
         return str
     end
+    _, str = getchar(str)
 
     local buff = {}
     local has_end_quote
-    local oldstr = str
     while #str ~= 0 do
         local c
         c, str = getchar(str)
         if c == quote then
-            str = str:sub(2)
             has_end_quote = true
             break
         end
 
         if c == "\\" then
             c, str = getchar(str)
-            if c:match("[bfnrtv0\"'\\]") then
-                c = escape_str[c]
-            elseif c == "x" then
-                local err = check_esc(str, 2, quote, "incomplete hex escape")
-                if err then
-                    return nil, err
-                end
-
-                local hexdigits
-                hexdigits, str = getchar(str, 2)
-                print(hexdigits, str)
-                local num = tonumber("0x" .. hexdigits)
-                if not num then
-                    return nil, "not a hex '" .. hexdigits .. "'"
-                end
-
-                c = string.char(num)
-            elseif c == "\n" or c == "\r" or c == line_sep or c == parag_sep then
+            local escaped_c = escape_str[c]
+            if not escaped_c and c == "\n" or c == "\r" then
                 c, str = getchar(str)
                 if c == "\r" then
                     c, str = getchar(str)
                 end
-            elseif c == "u" then
-                local err = check_esc(str, 4, quote, "incomplete utf8 escape")
-                if err then
-                    return nil, err
+                if c == quote then
+                    has_end_quote = true
+                    break
                 end
-
-                local codepoints
-                codepoints, str = getchar(str, 4)
-                local num = tonumber("0x" .. codepoints)
-                if not num then
-                    return nil, "not a hex '" .. codepoints .. "'"
+            elseif not escaped_c and c == "\226" then
+                _, str = getchar(str, 2)
+                c, str = getchar(str)
+                if c == quote then
+                    has_end_quote = true
+                    break
                 end
-
-                local ok, char = pcall(codepoint_to_utf8, num)
-                if ok and char then
-                    c = char
-                else
-                    return nil, char
+            elseif type(escaped_c) == "string" then
+                c = escape_str[c]
+            elseif type(escaped_c) == "function" then
+                c, str = escaped_c(str, quote)
+                if not c and str then
+                    return nil, str
                 end
             else
-                return nil, "unknown escape sequence '" .. c .. "'"
+                return nil, "unknown escape sequence '\\" .. c .. "'"
             end
         end
 
-        oldstr = str
         buff[#buff + 1] = c
     end
 
@@ -335,25 +355,276 @@ local function lex_string(tokens, str)
     end
 
     tokens[#tokens + 1] = buff
-    return oldstr:sub(2)
+    return str
 end
 
---[[
-local function lex(_, str)
+---@type lex_func
+local function lex_number(tokens, str)
+    if not matchs(str,
+            "^[-+]?Infinity",
+            "^[-+]?NaN",
+            "^[-+]?%.?%d")
+    then
+        return str
+    end
+
+    local num
+
+    local negate = ""
+    local c, strclone = getchar(str)
+    if c:match("[-+]") then
+        negate = c == "-" and "-" or ""
+        str = strclone
+    end
+
+    local special_num
+    special_num, strclone = getchar(str, 8)
+    if special_num:match("^Infinity") then
+        num = math.huge
+        if negate == "-" then
+            num = -num
+        end
+        str = strclone
+    elseif special_num:match("^NaN") then
+        num = 0 / 0
+        str = str:sub(4)
+    end
+
+    if not num then
+        num = {}
+        while #str ~= 0 do
+            c, str = getchar(str)
+            if c:match("[^0-9.eE]") then
+                str = c .. str
+                break
+            end
+            num[#num + 1] = c
+        end
+        num = tonumber(negate .. table.concat(num), 10)
+    end
+
+    tokens[#tokens + 1] = num
+
+    return str
+end
+
+---@type lex_func
+local function lex_hex(tokens, str)
+    if not str:match("^[-+]?0[Xx]%x") then
+        return str
+    end
+
+    local negate = ""
+    local c, strclone = getchar(str)
+    if c:match("[-+]") then
+        negate = c == "-" and "-" or ""
+        str = strclone
+    end
+
+    local num = {}
+    while #str ~= 0 do
+        c, str = getchar(str)
+        if c:match("[^xX%x]") then
+            str = c .. str
+            break
+        end
+        num[#num + 1] = c
+    end
+    ---@diagnostic disable-next-line: cast-local-type
+    num = tonumber(negate .. table.concat(num), 16)
+
+    tokens[#tokens + 1] = num
+
+    return str
+end
+
+---@type lex_func
+local function lex_boolean(tokens, str)
+    local bool, strclone = getchar(str, 5)
+    if bool:match("^false") then
+        tokens[#tokens + 1] = false
+        str = strclone
+    elseif bool:match("^true") then
+        tokens[#tokens + 1] = true
+        str = str:sub(5)
+    end
+
+    return str
+end
+
+---@type lex_func
+local function lex_null(tokens, str)
+    local null, strclone = getchar(str, 4)
+    if null == "null" then
+        tokens[#tokens + 1] = json5.null
+        str = strclone
+    end
+
+    return str
+end
+
+---@type lex_func
+local function lex_comment(_, str)
+    if not str:match("^//") then
+        return str
+    end
+
+    _, str = getchar(str, 2)
+    while #str ~= 0 do
+        local c, strclone
+        c, strclone = getchar(str)
+        if c == "\n" or c == "\r" or c == line_sep or c == parag_sep or c == "" then
+            str = strclone
+            break
+        end
+    end
+
+    return str
+end
+
+---@type lex_func
+local function lex_comment_long(_, str)
+    if not str:match("^/%*") then
+        return str
+    end
+
+    _, str = getchar(str, 2)
+    while #str ~= 0 do
+        local end_comment, strclone
+        end_comment, strclone = getchar(str, 2)
+        if end_comment == "*/" then
+            str = strclone
+            break
+        end
+        _, str = getchar(str)
+    end
+
+    return str
+end
+
+---@type lex_func
+local function lex_identifier(tokens, str)
+    -- TODO: allow unicode in identifier
+
+    if tokens[#tokens] == ":" then
+        return str
+    end
+
+    if not str:match("^[%a%$]%w?") then
+        return str
+    end
+
+    local buff = {}
+    while #str ~= 0 do
+        local c
+        c, str = getchar(str)
+        if c:match("[^%w%$]") then
+            str = c .. str
+            break
+        end
+        buff[#buff + 1] = c
+    end
+    ---@diagnostic disable-next-line: cast-local-type
+    buff = table.concat(buff)
+
+    tokens[#tokens + 1] = setmetatable({ buff }, { __json5_lex = "identifier" })
+
+    return str
+end
+
+local function lex(str)
     local tokens = {}
 
     while #str ~= 0 do
-        local json_value
-        if str:sub(1, 1):match("[\"']") then
-            str:
-        elseif matchs(str, unpack(number_patts)) then
-            local _, new_length = finds(str, unpack(number_patts))
-            new_length = new_length + 1
+        local err
+        local c, strclone = getchar(str)
+
+        if c:match("[,:%[%]{}]") then
+            tokens[#tokens + 1] = c
+            str = strclone
+        elseif c:match("%s") or c == "\226" then
+            str = strclone
+            if c == "\226" then
+                c, strclone = getchar(str, 2)
+                if c:match("\128[\168\169]") then
+                    str = strclone
+                end
+            end
+        else
+            ---@diagnostic disable:param-type-mismatch
+            str, err = lex_identifier(tokens, str)
+            if err then return nil, err end
+
+            str, err = lex_comment(tokens, str)
+            if err then return nil, err end
+
+            str, err = lex_comment_long(tokens, str)
+            if err then return nil, err end
+
+            str, err = lex_string(tokens, str)
+            if err then return nil, err end
+
+            str, err = lex_number(tokens, str)
+            if err then return nil, err end
+
+            str, err = lex_hex(tokens, str)
+            if err then return nil, err end
+
+            str, err = lex_boolean(tokens, str)
+            if err then return nil, err end
+
+            str, err = lex_null(tokens, str)
+            if err then return nil, err end
+            ---@diagnostic enable:param-type-mismatch
         end
     end
-end
-]]
 
-json5.test = lex_string
+    return tokens
+end
+
+---@alias parse_func fun(tokens: any[]): any?, string|any[]
+
+local parse
+
+---@type parse_func
+local function parse_array(tokens)
+    local t = {}
+
+    if tokens[1] == "]" then
+        return t, cdr(tokens)
+    end
+
+    local trail = false
+    while #tokens ~= 0 do
+        local v
+        v, tokens = parse(tokens)
+
+        if type(v) == "table" and (getmetatable(v) or {}).__json5_lex == "identifier" then
+            return nil, "invalid syntax: " .. v[1]
+        end
+
+        t[#t + 1] = v
+
+        local tok = car(tokens)
+        if tok == "]" then
+            return t, cdr(tokens)
+        else
+        end
+    end
+
+    return nil, "expected end-of-array bracket"
+end
+
+function parse(tokens)
+    local tok = car(tokens)
+
+    if tok == "[" then
+        return parse_array(cdr(tokens))
+    else
+        return tok, cdr(tokens)
+    end
+end
+
+json5.test = parse
 
 return json5
