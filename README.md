@@ -17,10 +17,12 @@ Parameters:
     - `explicit_positive_sign: boolean`: Explicitly add positive sign prefix to numbers.
     - `use_single_quote: boolean`: Use single quotes for string instead of double quotes
     - `json_compatible: boolean`: Enable compatibility with JSON, this will disables JSON5 goodies.
+
 Returns: `string`
 
 ### `json5.decode(str)`
 
 Parameters:
   - `str: string`: A JSON5 format string.
+
 Returns: `any`
