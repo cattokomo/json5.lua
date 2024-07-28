@@ -257,511 +257,76 @@ function json5.encode(value, options)
 
     local rope = {}
     local err = serializer[type(value)](rope, value, options)
-
     if err then
         return nil, err
     end
+
     return table.concat(rope)
 end
 
--- forward decl
-local check_chars, getchar
+local escapes = {
 
-local escape_str = {
-    b = "\b",
-    f = "\f",
-    n = "\n",
-    r = "\r",
-    t = "\t",
-    v = "\v",
-    ["0"] = "\0",
-    ['"'] = '"',
-    ["'"] = "'",
-    ["\\"] = "\\",
-    x = function(str, quote)
-        local err = check_chars(str, 2, quote, "incomplete hex escape")
-        if err then
-            return nil, err
-        end
-
-        local hexdigits
-        hexdigits, str = getchar(str, 2)
-
-        local num = tonumber("0x" .. hexdigits)
-        if not num then
-            return nil, "not a hex '" .. hexdigits .. "'"
-        end
-
-        return string.char(num), str
-    end,
-    u = function(str, quote)
-        local err = check_chars(str, 4, quote, "incomplete utf8 escape")
-        if err then
-            return nil, err
-        end
-
-        local codepoints
-        codepoints, str = getchar(str, 4)
-        local num = tonumber("0x" .. codepoints)
-        if not num then
-            return nil, "not a hex '" .. codepoints .. "'"
-        end
-
-        local ok, char = pcall(codepoint_to_utf8, num)
-        if ok and char then
-            return char, str
-        else
-            return nil, char
-        end
-    end
 }
-
-local line_sep = "\226\128\168"
-local parag_sep = "\226\128\169"
-
----@param str string
----@param n number?
----@return string
----@return string
-function getchar(str, n)
-    n = n or 1
-    return str:sub(1, n), str:sub(1 + n)
-end
-
----@param str string
----@param len integer
----@param quote string
----@param err string
-function check_chars(str, len, quote, err)
-    for i = 1, len do
-        local c = str:sub(i, i)
-        if c == quote or c == "" then
-            return err
-        end
-    end
-end
-
----@alias lex_func fun(tokens: any[], str: string): string?, string?
-
----@type lex_func
-local function lex_string(tokens, str)
-    local quote = str:match("^['\"]")
-    if not quote then
-        return str
-    end
-    _, str = getchar(str)
-
-    local buff = {}
-    local has_end_quote
-    while #str ~= 0 do
-        local c
-        c, str = getchar(str)
-        if c == quote then
-            has_end_quote = true
-            break
-        end
-
-        if c == "\\" then
-            c, str = getchar(str)
-            local escaped_c = escape_str[c]
-            if not escaped_c and c == "\n" or c == "\r" then
-                c, str = getchar(str)
-                if c == "\r" then
-                    c, str = getchar(str)
-                end
-                if c == quote then
-                    has_end_quote = true
-                    break
-                end
-            elseif not escaped_c and c == "\226" then
-                _, str = getchar(str, 2)
-                c, str = getchar(str)
-                if c == quote then
-                    has_end_quote = true
-                    break
-                end
-            elseif type(escaped_c) == "string" then
-                c = escape_str[c]
-            elseif type(escaped_c) == "function" then
-                c, str = escaped_c(str, quote)
-                if not c and str then
-                    return nil, str
-                end
-            else
-                return nil, "unknown escape sequence '\\" .. c .. "'"
-            end
-        end
-
-        buff[#buff + 1] = c
-    end
-
-    ---@diagnostic disable-next-line: cast-local-type
-    buff = table.concat(buff)
-    if not has_end_quote then
-        return nil, "expected end-of-string quote"
-    end
-
-    tokens[#tokens + 1] = buff
-    return str
-end
-
----@type lex_func
-local function lex_number(tokens, str)
-    if not matchs(str,
-            "^[-+]?Infinity",
-            "^[-+]?NaN",
-            "^[-+]?%.?%d")
-    then
-        return str
-    end
-
-    local num
-
-    local negate = ""
-    local c, strclone = getchar(str)
-    if c:match("[-+]") then
-        negate = c == "-" and "-" or ""
-        str = strclone
-    end
-
-    local special_num
-    special_num, strclone = getchar(str, 8)
-    if special_num:match("^Infinity") then
-        num = math.huge
-        if negate == "-" then
-            num = -num
-        end
-        str = strclone
-    elseif special_num:match("^NaN") then
-        num = 0 / 0
-        str = str:sub(4)
-    end
-
-    if not num then
-        num = {}
-        while #str ~= 0 do
-            c, str = getchar(str)
-            if c:match("[^0-9.eE]") then
-                str = c .. str
-                break
-            end
-            num[#num + 1] = c
-        end
-        num = tonumber(negate .. table.concat(num), 10)
-    end
-
-    tokens[#tokens + 1] = num
-
-    return str
-end
-
----@type lex_func
-local function lex_hex(tokens, str)
-    if not str:match("^[-+]?0[Xx]%x") then
-        return str
-    end
-
-    local negate = ""
-    local c, strclone = getchar(str)
-    if c:match("[-+]") then
-        negate = c == "-" and "-" or ""
-        str = strclone
-    end
-
-    local num = {}
-    while #str ~= 0 do
-        c, str = getchar(str)
-        if c:match("[^xX%x]") then
-            str = c .. str
-            break
-        end
-        num[#num + 1] = c
-    end
-    ---@diagnostic disable-next-line: cast-local-type
-    num = tonumber(negate .. table.concat(num), 16)
-
-    tokens[#tokens + 1] = num
-
-    return str
-end
-
----@type lex_func
-local function lex_boolean(tokens, str)
-    local bool, strclone = getchar(str, 5)
-    if bool:match("^false") then
-        tokens[#tokens + 1] = false
-        str = strclone
-    elseif bool:match("^true") then
-        tokens[#tokens + 1] = true
-        str = str:sub(5)
-    end
-
-    return str
-end
-
----@type lex_func
-local function lex_null(tokens, str)
-    local null, strclone = getchar(str, 4)
-    if null == "null" then
-        tokens[#tokens + 1] = json5.null
-        str = strclone
-    end
-
-    return str
-end
-
----@type lex_func
-local function lex_comment(_, str)
-    if not str:match("^//") then
-        return str
-    end
-
-    _, str = getchar(str, 2)
-    while #str ~= 0 do
-        local c, strclone
-        c, strclone = getchar(str)
-        if c == "\n" or c == "\r" or c == line_sep or c == parag_sep or c == "" then
-            str = strclone
-            break
-        end
-    end
-
-    return str
-end
-
----@type lex_func
-local function lex_comment_long(_, str)
-    if not str:match("^/%*") then
-        return str
-    end
-
-    _, str = getchar(str, 2)
-    while #str ~= 0 do
-        local end_comment, strclone
-        end_comment, strclone = getchar(str, 2)
-        if end_comment == "*/" then
-            str = strclone
-            break
-        end
-        _, str = getchar(str)
-    end
-
-    return str
-end
-
----@type lex_func
-local function lex_identifier(tokens, str)
-    -- TODO: allow unicode in identifier
-
-    if tokens[#tokens] == ":" then
-        return str
-    end
-
-    if not str:match("^[%a%$_][%w_]?") then
-        return str
-    end
-
-    local buff = {}
-    while #str ~= 0 do
-        local c
-        c, str = getchar(str)
-        if c:match("[^%w%$_]") then
-            str = c .. str
-            break
-        end
-        buff[#buff + 1] = c
-    end
-    ---@diagnostic disable-next-line: cast-local-type
-    buff = table.concat(buff)
-
-    tokens[#tokens + 1] = setmetatable({ buff }, { __json5_lex = "identifier" })
-
-    return str
-end
-
-local function lex(str)
-    local tokens = {}
-
-    while #str ~= 0 do
-        local err
-        local c, strclone = getchar(str)
-
-        if c:match("[,:%[%]{}]") then
-            tokens[#tokens + 1] = c
-            str = strclone
-        elseif c:match("%s") or c == "\226" then
-            str = strclone
-            if c == "\226" then
-                c, strclone = getchar(str, 2)
-                if c:match("\128[\168\169]") then
-                    str = strclone
-                end
-            end
-        else
-            ---@diagnostic disable:param-type-mismatch
-            str, err = lex_comment(tokens, str)
-            if err then return nil, err end
-
-            str, err = lex_comment_long(tokens, str)
-            if err then return nil, err end
-
-            str, err = lex_string(tokens, str)
-            if err then return nil, err end
-
-            str, err = lex_hex(tokens, str)
-            if err then return nil, err end
-
-            str, err = lex_number(tokens, str)
-            if err then return nil, err end
-
-            str, err = lex_boolean(tokens, str)
-            if err then return nil, err end
-
-            str, err = lex_null(tokens, str)
-            if err then return nil, err end
-
-            str, err = lex_identifier(tokens, str)
-            if err then return nil, err end
-            ---@diagnostic enable:param-type-mismatch
-        end
-    end
-
-    return tokens
-end
-
----@alias parse_func fun(tokens: any[]): any?, string|any[]
-
----@param tbl any
----@param typ string
----@return boolean
-local function check_lex_type(tbl, typ)
-    return type(tbl) == "table" and (getmetatable(tbl) or {}).__json5_lex == typ
-end
 
 local parse
 
----@type parse_func
-local function parse_array(tokens)
-    local t = {}
-
-    if tokens[1] == "]" then
-        table.remove(tokens, 1)
-        return t, tokens
-    end
-
-    while #tokens ~= 0 do
-        local tok = tokens[1]
-        if tok == "]" then
-            table.remove(tokens, 1)
-            return t, tokens
-        elseif tok == "," then
-            return nil, "only single trailing comma is allowed in array"
-        end
-
-        local v
-        v, tokens = parse(tokens)
-
-        if check_lex_type(v, "identifier") then
-            return nil, "invalid syntax: " .. v[1]
-        end
-
-        t[#t + 1] = v
-
-        tok = tokens[1]
-        if tok == "]" then
-            table.remove(tokens, 1)
-            return t, tokens
-        elseif tok ~= "," then
-            return nil, "expected comma after value in array"
-        end
-
-        table.remove(tokens, 1)
-    end
-
-    return nil, "expected end-of-array bracket"
-end
+---@alias parse_func function(result: any[], str: string[]): string?
 
 ---@type parse_func
-local function parse_object(tokens)
-    local t = {}
+local function parse_string(result, ptr)
+    local str = ptr[1]
+    local quote = str:sub(1, 1)
 
-    if tokens[1] == "}" then
-        table.remove(tokens, 1)
-        return t, tokens
+    local start = str:find(quote .. ".*")
+    local _end = str:find(quote, 2)
+
+    if not _end then
+        return "unfinished string on byte " .. start
     end
 
-    while #tokens ~= 0 do
-        local tok = tokens[1]
-        if tok == "}" then
-            table.remove(tokens, 1)
-            return t, tokens
-        elseif tok == "," then
-            return nil, "only single trailing comma is allowed in object"
-        end
+    local err
+    local content = str:sub(start + 1, _end - 1)
+        :gsub("\\x(..)", function(c)
+            local loc_start, loc_end = str:find("\\x" .. c)
+            if not c:match("%x+") then
+                err = "unexpected escape sequence " .. ("%d, %d"):format(loc_start, loc_end)
+                return
+            end
+            ---@diagnostic disable-next-line: param-type-mismatch
+            return string.char(tonumber("0x" .. c))
+        end)
+        :gsub("\\u(....)", function(c)
+            local loc_start, loc_end = str:find("\\u" .. c)
+            if not c:match("%x+") then
+                err = "unexpected escape sequence " .. ("%d, %d"):format(loc_start, loc_end)
+                return
+            end
+            ---@diagnostic disable-next-line: param-type-mismatch
+            return codepoint_to_utf8(tonumber("0x" .. c))
+        end)
 
-        local k = tokens[1]
-
-        if type(k) == "string" then
-            table.remove(tokens, 1)
-        elseif check_lex_type(k, "identifier") then
-            k = k[1]
-            table.remove(tokens, 1)
-        else
-            return nil, "expected key to be string, got " .. type(k)
-        end
-
-        if table.remove(tokens, 1) ~= ":" then
-            return nil, "expected colon after key in object"
-        end
-
-        local v
-        v, tokens = parse(tokens)
-
-        t[k] = v
-
-
-        tok = tokens[1]
-        if tok == "}" then
-            table.remove(tokens, 1)
-            return t, tokens
-        elseif tok ~= "," then
-            return nil, "expected comma after pair in object"
-        end
-
-        table.remove(tokens, 1)
-    end
-
-    return nil, "expected end-of-object bracket"
-end
-
----@param tokens any[]
----@return any?
----@return any[]|string
-function parse(tokens)
-    local tok = table.remove(tokens, 1)
-
-    if tok == "[" then
-        return parse_array(tokens)
-    elseif tok == "{" then
-        return parse_object(tokens)
-    elseif check_lex_type(tok, "identifier") then
-        return nil, "unexpected identifer: " .. tok[1]
-    else
-        return tok, tokens
-    end
-end
-
-function json5.decode(str)
-    local v, err = lex(str)
     if err then
-        return nil, err
+        return err
     end
-    ---@diagnostic disable-next-line: cast-local-type, param-type-mismatch
-    v, err = parse(v)
-    if not v and err then
-        return nil, err
-    end
-    return v
+
+    result[#result + 1] = content
+    ptr[1] = ptr[1]:sub(_end + 1)
 end
+
+function parse(result, str)
+    local result = {}
+    local ptr = { str }
+
+    while #str ~= 0 do
+        local tok = str:sub(1, 1)
+        if tok == '"' or tok == "'" then
+            parse_string(result, ptr)
+        end
+    end
+
+    return result[1]
+end
+
+json5.test = parse_string
 
 return json5
